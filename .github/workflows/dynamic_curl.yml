@@ -1,0 +1,29 @@
+name: Dynamic curl build (x86_64-unknown-linux-gnu)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Vector (dynamic curl)
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross
+        run: |
+          rustup target add x86_64-unknown-linux-gnu
+          cargo install cross --version 0.2.4 --force --locked
+
+      - name: Build with dynamic curl
+        run: |
+          cross build --release --target x86_64-unknown-linux-gnu \
+            --no-default-features \
+            --features target-x86_64-unknown-linux-gnu,rdkafka-curl-dynamic
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vector-dynamic-curl-x86_64-unknown-linux-gnu
+          path: ./target/x86_64-unknown-linux-gnu/release/vector
