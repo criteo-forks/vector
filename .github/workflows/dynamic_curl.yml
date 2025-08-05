@@ -2,9 +2,6 @@ name: Dynamic curl build (x86_64-unknown-linux-gnu)
 
 on:
   workflow_dispatch:
-  # or run when a PR is opened/updated that targets `main`
-  pull_request:
-    branches: [ main ]
 
 jobs:
   build:
