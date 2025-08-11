@@ -39,6 +39,57 @@ jobs:
           name: vector-dynamic-curl-x86_64-unknown-linux-gnu.tar.gz
           path: ./target/x86_64-unknown-linux-gnu/release/vector-dynamic-curl-x86_64-unknown-linux-gnu.tar.gz
 
+      # Release creation and asset upload are handled in a separate job
+
+  build-arm64:
+    name: Build Vector (dynamic curl, aarch64)
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross
+        run: |
+          rustup target add aarch64-unknown-linux-gnu
+          cargo install cross --version 0.2.4 --force --locked
+
+      - name: Build Vector cross image (aarch64)
+        run: make cross-image-aarch64-unknown-linux-gnu
+
+      - name: Build with dynamic curl (aarch64)
+        run: |
+          cross build --release --target aarch64-unknown-linux-gnu \
+            --no-default-features \
+            --features target-aarch64-unknown-linux-gnu,rdkafka-curl-dynamic
+
+      - name: Package vector into tar.gz (aarch64)
+        run: |
+          cd target/aarch64-unknown-linux-gnu/release
+          tar -czf vector-dynamic-curl-aarch64-unknown-linux-gnu.tar.gz vector
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vector-dynamic-curl-aarch64-unknown-linux-gnu.tar.gz
+          path: ./target/aarch64-unknown-linux-gnu/release/vector-dynamic-curl-aarch64-unknown-linux-gnu.tar.gz
+
+  release:
+    name: Create GitHub Release and upload assets
+    runs-on: ubuntu-24.04
+    needs: [build, build-arm64]
+    steps:
+      - name: Download amd64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vector-dynamic-curl-x86_64-unknown-linux-gnu.tar.gz
+          path: dist/amd64
+
+      - name: Download arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vector-dynamic-curl-aarch64-unknown-linux-gnu.tar.gz
+          path: dist/arm64
+
       - name: Create GitHub Release
         id: create_release
         uses: actions/create-release@v1.1.4
@@ -50,12 +101,22 @@ jobs:
           draft: false
           prerelease: true
 
-      - name: Upload release asset
+      - name: Upload release asset (amd64)
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./target/x86_64-unknown-linux-gnu/release/vector-dynamic-curl-x86_64-unknown-linux-gnu.tar.gz
+          asset_path: dist/amd64/vector-dynamic-curl-x86_64-unknown-linux-gnu.tar.gz
           asset_name: vector-dynamic-curl-x86_64-unknown-linux-gnu.tar.gz
+          asset_content_type: application/gzip
+
+      - name: Upload release asset (arm64)
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: dist/arm64/vector-dynamic-curl-aarch64-unknown-linux-gnu.tar.gz
+          asset_name: vector-dynamic-curl-aarch64-unknown-linux-gnu.tar.gz
           asset_content_type: application/gzip
