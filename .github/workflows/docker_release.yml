@@ -1,0 +1,154 @@
+name: Build and push Docker image from Release (debian)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to use (defaults to latest)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker-from-release:
+    name: Build and push Docker image to GHCR
+    # Only auto-run for dynamic-curl releases; always allow manual runs
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'dynamic-curl-'))
+    runs-on: ubuntu-24.04
+    env:
+      IMAGE_REPO: ghcr.io/criteo-forks/vector
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Login to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine release tag
+        id: get_tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          EVENT_NAME="${{ github.event_name }}"
+          INPUT_TAG="${{ inputs.release_tag }}"
+          if [ "$EVENT_NAME" = "release" ] && [ -n "${{ github.event.release.tag_name }}" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          elif [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$(gh release list --limit 1 --json tagName --jq '.[0].tagName')"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Determine if prerelease
+        id: prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.get_tag.outputs.tag }}"
+          # Default to true if not determinable (avoid publishing latest-* by accident)
+          IS_PRERELEASE=true
+          if IS=$(gh release view "$TAG" --repo "${{ github.repository }}" --json isPrerelease --jq .isPrerelease 2>/dev/null); then
+            IS_PRERELEASE="$IS"
+          fi
+          echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: Download release artifact (dynamic-curl)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          mkdir -p release-artifacts
+          TAG="${{ steps.get_tag.outputs.tag }}"
+          # The release event may fire before assets finish uploading; retry until present
+          for i in $(seq 1 30); do
+            if gh release download "$TAG" \
+                 --repo "${{ github.repository }}" \
+                 --dir release-artifacts \
+                 --pattern "vector-dynamic-curl-*.tar.gz"; then
+              if ls release-artifacts/vector-dynamic-curl-*.tar.gz >/dev/null 2>&1; then
+                break
+              fi
+            fi
+            echo "Asset not available yet, retrying in 10s ($i/30)" >&2
+            sleep 10
+          done
+          ls -la release-artifacts
+          if ! ls release-artifacts/vector-dynamic-curl-*.tar.gz >/dev/null 2>&1; then
+            echo "Release asset not found for tag $TAG" >&2
+            exit 1
+          fi
+          tar -xzvf release-artifacts/vector-dynamic-curl-*.tar.gz -C release-artifacts
+          test -x release-artifacts/vector
+
+      - name: Prepare default config for image
+        run: |
+          set -euxo pipefail
+          mkdir -p release-artifacts/etc/vector
+          mkdir -p release-artifacts/var/lib/vector
+          # Copy the default config from the repo; image users can override with -v/-c
+          cp config/vector.yaml release-artifacts/etc/vector/vector.yaml
+
+      - name: Create Dockerfile (debian)
+        run: |
+          set -euxo pipefail
+          cat > release-artifacts/Dockerfile << 'EOF'
+          FROM docker.io/debian:bookworm-slim
+
+          # https://github.com/opencontainers/image-spec/blob/main/annotations.md
+          LABEL org.opencontainers.image.url="https://vector.dev"
+          LABEL org.opencontainers.image.source="https://github.com/criteo-forks/vector"
+          LABEL org.opencontainers.image.documentation="https://vector.dev/docs"
+
+          # we want the latest versions of these
+          # hadolint ignore=DL3008
+          RUN apt-get update && \
+              apt-get install -y --no-install-recommends ca-certificates tzdata libcurl4 && \
+              rm -rf /var/lib/apt/lists/*
+
+          COPY vector /usr/bin/vector
+          COPY etc/vector/vector.yaml /etc/vector/vector.yaml
+          COPY var/lib/vector /var/lib/vector
+
+          # Smoke test
+          RUN ["/usr/bin/vector", "--version"]
+
+          ENTRYPOINT ["/usr/bin/vector"]
+          EOF
+
+      - name: Set tags
+        id: tags
+        run: |
+          set -euxo pipefail
+          TAG="${{ steps.get_tag.outputs.tag }}"
+          PRIMARY_TAG="${{ env.IMAGE_REPO }}:${TAG}-debian"
+          TAGS="$PRIMARY_TAG"
+          if [ "${{ steps.prerelease.outputs.is_prerelease }}" = "false" ]; then
+            TAGS="$TAGS\n${{ env.IMAGE_REPO }}:latest-debian"
+          fi
+          echo "tags<<EOF" >> "$GITHUB_OUTPUT"
+          echo -e "$TAGS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push (linux/amd64)
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: release-artifacts
+          file: release-artifacts/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
