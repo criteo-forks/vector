@@ -3,6 +3,10 @@ name: Dynamic curl build (x86_64-unknown-linux-gnu)
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   build:
     name: Build Vector (dynamic curl)
@@ -27,3 +31,84 @@ jobs:
         with:
           name: vector-dynamic-curl-x86_64-unknown-linux-gnu
           path: ./target/x86_64-unknown-linux-gnu/release/vector
+
+  image:
+    name: Build Docker image from artifact
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vector-dynamic-curl-x86_64-unknown-linux-gnu
+          path: dist
+
+      - name: Stage vector for packaging
+        run: |
+          set -euo pipefail
+          mkdir -p target/x86_64-unknown-linux-gnu/release
+          VECTOR_PATH=$(find dist -type f -name vector -print -quit)
+          install -m 0755 "$VECTOR_PATH" target/x86_64-unknown-linux-gnu/release/vector
+          ls -l target/x86_64-unknown-linux-gnu/release/vector
+
+      - name: Build Debian package with cargo vdev (in dev image)
+        env:
+          VECTOR_VERSION: ${{ github.sha }}
+        run: |
+          docker run --rm \
+            -v "${PWD}":/git/vectordotdev/vector/ \
+            -e TARGET=x86_64-unknown-linux-gnu \
+            -e VECTOR_VERSION \
+            docker.io/timberio/vector-dev:sha-3eadc96742a33754a5859203b58249f6a806972a \
+            cargo vdev package deb
+          ls -l target/artifacts
+
+      - name: Build distroless-libc image from official Dockerfile
+        run: |
+          docker build -t vector-dynamic-curl:${{ github.sha }} \
+            -f distribution/docker/distroless-libc/Dockerfile \
+            target/artifacts
+          docker image ls vector-dynamic-curl:${{ github.sha }}
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Tag image for GHCR
+        run: |
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE=ghcr.io/${OWNER_LC}/vector-dynamic-curl:${{ github.sha }}
+          docker tag vector-dynamic-curl:${{ github.sha }} "$IMAGE"
+          echo "GHCR_IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      - name: Push image to GHCR
+        run: docker push "$GHCR_IMAGE"
+
+      - name: Make GHCR package public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          OWNER="${{ github.repository_owner }}"
+          PKG="vector-dynamic-curl"
+          BODY='{"visibility":"public"}'
+          HDRS=(
+            -H "Authorization: Bearer ${GH_TOKEN}"
+            -H "Accept: application/vnd.github+json"
+            -H "X-GitHub-Api-Version: 2022-11-28"
+            -sS -o /dev/null -w "%{http_code}\n"
+          )
+          # Try org endpoint first; if it fails (e.g., 404), try user endpoint
+          CODE=$(curl -X PUT "https://api.github.com/orgs/${OWNER}/packages/container/${PKG}/visibility" "${HDRS[@]}" -d "${BODY}" || true)
+          if [ "${CODE}" != "204" ]; then
+            curl -X PUT "https://api.github.com/user/packages/container/${PKG}/visibility" "${HDRS[@]}" -d "${BODY}"
+          fi
+
+      - name: Save image as tarball
+        run: |
+          docker save vector-dynamic-curl:${{ github.sha }} -o vector-dynamic-curl-${{ github.sha }}.tar
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector-dynamic-curl-image-${{ github.sha }}.tar
+          path: vector-dynamic-curl-${{ github.sha }}.tar
